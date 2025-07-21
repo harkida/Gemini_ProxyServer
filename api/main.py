@@ -7,8 +7,8 @@ import os
 app = Flask(__name__)
 
 # Vercel 환경 변수에서 API 키를 가져옵니다.
-# Vercel 프로젝트 설정에 'GOOGLE_API_KEY'라는 이름으로 키를 저장해야 합니다.
-API_KEY = os.environ.get("GOOGLE_API_KEY")
+# Vercel 프로젝트 설정에 'GEMINI_API_KEY'라는 이름으로 키를 저장해야 합니다.
+API_KEY = os.environ.get("GEMINI_API_KEY")
 
 # Gemini API 엔드포인트 URL
 # API 키가 없는 경우를 대비하여, 키가 있을 때만 URL을 완성합니다.
