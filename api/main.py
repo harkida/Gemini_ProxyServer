@@ -2,16 +2,16 @@ from flask import Flask, request, jsonify
 import requests
 import json
 import os
+import logging
 
-# Flask 앱을 생성합니다. Vercel은 이 'app' 변수를 찾아서 실행합니다.
+# Flask 앱 및 로깅 설정
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
 
 # Vercel 환경 변수에서 API 키를 가져옵니다.
-# Vercel 프로젝트 설정에 'GEMINI_API_KEY'라는 이름으로 키를 저장해야 합니다.
 API_KEY = os.environ.get("GEMINI_API_KEY")
 
 # Gemini API 엔드포인트 URL
-# API 키가 없는 경우를 대비하여, 키가 있을 때만 URL을 완성합니다.
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={API_KEY}" if API_KEY else None
 
 # LLM에게 보낼 프롬프트 '틀'입니다.
@@ -56,55 +56,65 @@ True / False
 *   **학생 답안 (이탈리아어):** {StudentAnswer}
 """
 
-# Vercel이 /api/proxy 경로로 오는 POST 요청을 처리하도록 지정합니다.
 @app.route('/api/proxy', methods=['POST'])
 def handle_proxy():
-    # API 키가 설정되지 않았으면 오류를 반환합니다.
     if not GEMINI_API_URL:
-        # 서버 로그에 오류를 남깁니다.
-        app.logger.error("GOOGLE_API_KEY is not set in Vercel environment variables.")
+        app.logger.error("CRITICAL: GOOGLE_API_KEY is not set.")
         return jsonify({"error": "API key is not configured on the server."}), 500
 
     try:
-        # 1. 언리얼 엔진에서 보낸 요청의 본문(JSON)을 읽습니다.
         client_data = request.get_json()
         if not client_data:
             return jsonify({"error": "Invalid JSON format in request body"}), 400
-            
+
         question_sentence = client_data.get('question')
         student_answer = client_data.get('answer')
 
         if not question_sentence or not student_answer:
             return jsonify({"error": "Request body must contain 'question' and 'answer' fields."}), 400
 
-        # 2. 프롬프트 '틀'에 내용을 채워 최종 프롬프트를 완성합니다.
         final_prompt = PROMPT_TEMPLATE.format(QuestionSentence=question_sentence, StudentAnswer=student_answer)
         
-        # 3. Gemini API가 요구하는 형식에 맞춰 최종 요청 데이터를 만듭니다.
         gemini_payload = {
             "contents": [{"parts": [{"text": final_prompt}]}]
         }
 
-        # 4. 완성된 요청을 실제 Gemini API로 전송합니다.
         headers = {'Content-Type': 'application/json'}
-        # 타임아웃을 15초로 설정 (Vercel 타임아웃보다 길게)
-        response = requests.post(GEMINI_API_URL, headers=headers, data=json.dumps(gemini_payload), timeout=15)
-        response.raise_for_status() # 200번대 응답이 아니면 오류를 발생시킵니다.
+        response = requests.post(GEMINI_API_URL, headers=headers, data=json.dumps(gemini_payload), timeout=25)
+        
+        app.logger.info(f"Gemini API Response Status: {response.status_code}")
+        app.logger.info(f"Gemini API Response Body: {response.text}")
 
-        # 5. Gemini API의 응답을 처리합니다.
+        response.raise_for_status()
+
         response_json = response.json()
-        result_text = response_json['candidates'][0]['content']['parts'][0]['text']
+
+        if 'candidates' not in response_json or not response_json['candidates']:
+            app.logger.error(f"Gemini response is missing 'candidates'. Full response: {response.text}")
+            return jsonify({"error": "AI model returned an empty or invalid response.", "details": "Response missing 'candidates'"}), 502
+        
+        first_candidate = response_json['candidates'][0]
+        
+        # 안전성 검사: finishReason이 'SAFETY' 등 다른 이유로 막혔는지 확인
+        if 'finishReason' in first_candidate and first_candidate['finishReason'] != 'STOP':
+            app.logger.error(f"Gemini generation stopped for reason: {first_candidate['finishReason']}. Full candidate: {first_candidate}")
+            return jsonify({"error": "AI content generation was blocked.", "details": f"Reason: {first_candidate.get('finishReason')}"}), 502
+
+        if 'content' not in first_candidate or 'parts' not in first_candidate['content'] or not first_candidate['content']['parts']:
+            app.logger.error(f"Gemini response is missing 'content' or 'parts'. Full candidate: {first_candidate}")
+            return jsonify({"error": "AI model returned an invalid content structure.", "details": "Response missing 'content' or 'parts'"}), 502
+
+        result_text = first_candidate['content']['parts'][0].get('text', '')
 
         parts = result_text.strip().split('\n')
-        display_message = parts[0] if len(parts) > 0 else "메시지를 받지 못했습니다."
-        is_correct_str = parts[1] if len(parts) > 1 else "False"
+        display_message = parts[0] if len(parts) > 0 and parts[0] else "메시지를 받지 못했습니다."
+        is_correct_str = parts[1] if len(parts) > 1 and parts[1] else "False"
 
         response_data = {
             "message": display_message,
-            "isCorrect": is_correct_str.lower() == 'true'
+            "isCorrect": is_correct_str.strip().lower() == 'true'
         }
 
-        # 6. 최종 결과를 JSON 형태로 언리얼 엔진에 반환합니다.
         return jsonify(response_data)
 
     except requests.exceptions.Timeout:
@@ -112,11 +122,12 @@ def handle_proxy():
         return jsonify({"error": "The request to the AI model timed out."}), 504
 
     except requests.exceptions.RequestException as e:
-        # Gemini API 요청 관련 오류 (예: 400, 403, 500)
-        app.logger.error(f"Error from Google Gemini API: {e.response.text if e.response else e}")
-        return jsonify({"error": "Failed to get response from AI model.", "details": str(e)}), 502
+        error_details = str(e)
+        if e.response is not None:
+            error_details = e.response.text
+        app.logger.error(f"Error from Google Gemini API: {error_details}")
+        return jsonify({"error": "Failed to get response from AI model.", "details": error_details}), 502
         
     except Exception as e:
-        # 그 외 모든 예상치 못한 오류를 처리합니다.
         app.logger.error(f"An unexpected error occurred: {e}", exc_info=True)
         return jsonify({"error": "An internal server error occurred."}), 500
